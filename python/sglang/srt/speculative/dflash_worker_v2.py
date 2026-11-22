@@ -88,6 +88,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
+    commit_accept,
     compute_dflash_sampling_correct_drafts_and_bonus,
     get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
@@ -266,16 +267,6 @@ class _DflashDraftSampler:
         selected = self.selected_ids[:, :n]
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
-
-
-def _commit_accept(candidates, accept_len, bonus_tokens):
-    """The committed block: drafted tokens shifted left, the bonus at the accept
-    boundary. Returns it with the commit lengths."""
-    out_tokens = torch.empty_like(candidates, dtype=torch.int64)
-    out_tokens[:, :-1].copy_(candidates[:, 1:])
-    out_tokens[:, -1].fill_(0)
-    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
-    return out_tokens, accept_len.to(torch.int32) + 1
 
 
 def _chain_accept_indices(commit_lens: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -2850,7 +2841,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            out_tokens, commit_lens = commit_accept(candidates, accept_len, bonus)
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -2866,7 +2857,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            out_tokens, commit_lens = commit_accept(candidates, accept_len, bonus)
         else:
             if target_predict is None:
                 target_predict = torch.argmax(next_token_logits, dim=-1)
@@ -2880,7 +2871,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     verify_num_draft_tokens=int(self.block_size),
                     cutoff_verify_lens=cutoff_verify_lens,
                 )
-                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+                out_tokens, commit_lens = commit_accept(candidates, accept_len, bonus)
             elif self._use_triton_accept_bonus:
                 try:
                     (
@@ -2910,7 +2901,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         candidates=candidates,
                         target_predict=target_predict,
                     )
-                    out_tokens, commit_lens = _commit_accept(
+                    out_tokens, commit_lens = commit_accept(
                         candidates, accept_len, bonus
                     )
             else:
@@ -2918,7 +2909,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     candidates=candidates,
                     target_predict=target_predict,
                 )
-                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+                out_tokens, commit_lens = commit_accept(candidates, accept_len, bonus)
         if SIMULATE_ACC_LEN > 0:
             # new_seq_lens, if the Triton accept wrote it, holds the real
             # accept; it comes back rewritten from the forced lengths, or None.
